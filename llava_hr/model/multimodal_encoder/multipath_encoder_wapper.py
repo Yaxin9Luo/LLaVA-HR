@@ -8,8 +8,30 @@ from torch.nn.init import trunc_normal_
 from copy import deepcopy
 import random
 import math
-
-
+# from paddleocr import PaddleOCR
+# import numpy as np
+# from PIL import Image
+# from torchvision import transforms
+# import paddle
+cfg={
+    "crop_size": 256,
+    "do_center_crop": True,
+    "do_normalize": True,
+    "do_resize": True,
+    "feature_extractor_type": "CLIPFeatureExtractor",
+    "image_mean": [
+        0.48145466,
+        0.4578275,
+        0.40821073
+    ],
+    "image_std": [
+        0.26862954,
+        0.26130258,
+        0.27577711
+    ],
+    "resample": 3,
+    "size": 256
+}
 class MultiPathAlignModule(nn.Module):
     def __init__(self, fast_vision_dim, slow_vision_dim):
         super().__init__()
@@ -128,8 +150,6 @@ class MultiPathCLIPVisionTower(nn.Module):
         self.splits = self.select_layer // 100 if self.select_layer > 100 else 1
         self.enable_adapter= not args.freeze_vision
         self.image_size=args.input_image_size
-
-
         if self.enable_adapter:
             self.align_stages_latent = nn.ModuleList([S2FStitchAlignModuleV2(self.fast_vision_tower.hidden_size,
                                                                              self.slow_vision_tower.hidden_size,
@@ -149,12 +169,33 @@ class MultiPathCLIPVisionTower(nn.Module):
         self.is_loaded = True
 
     def forward(self, x):
-
+        # ocr_results = []
+        # mean = torch.tensor(cfg['image_mean']).view(1, 3, 1, 1).to(device=x.device, dtype=x.dtype)
+        # std = torch.tensor(cfg['image_std']).view(1, 3, 1, 1).to(device=x.device, dtype=x.dtype)
+        # x_unnormalized = x * std + mean
+        # x_unnormalized = torch.clamp(x_unnormalized, 0, 1)
+        # x_float32 = x_unnormalized.to(torch.float32)
+        # x_np = x_float32.permute(0, 2, 3, 1).cpu().numpy() 
+        # for i, img_tensor in enumerate(x_unnormalized):
+        #     # Convert the tensor to PIL image
+        #     img_pil = transforms.ToPILImage()(img_tensor.cpu())
+            
+        #     # Save the image
+        #     img_pil.save(f'/data/luogen_code/check_image_{i}.png')
+            
+        # #     print(f'Saved check_image_{i}.png')
+        # for img_np in x_np:
+        #     with torch.inference_mode():
+        #         ocr_result = self.ocr_model.ocr(img_np)
+        #         verbalization_result = make_ocr_prompt(ocr_result[0])
+        #         ocr_results.append(verbalization_result)
+        # exit()
         # fast & slow brach
         fast_blk = self.fast_vision_tower.vision_tower.vision_model.encoder.layers
         slow_blk = self.slow_vision_tower.vision_tower.stages
         n_blks = len(fast_blk) // 4
         assert len(fast_blk) == n_blks * 4
+        
 
         # pre-process for fast_vision_towe
         fast_image_size=max(int(self.image_size/32*14),336)
@@ -253,3 +294,19 @@ class MultiPathCLIPVisionTower(nn.Module):
     @property
     def num_patches(self):
         return self.fast_vision_tower.num_patches
+def make_ocr_prompt(ocr_result):
+        if ocr_result is None or all(text_inform[1][1] < 0.85 for text_inform in ocr_result):
+            return "The image includes text descriptions: N/A ."
+        ocr_texts = [text_inform[1][0] for text_inform in ocr_result if text_inform[1][1] >= 0.85]
+        
+        # Verbalization
+        if len(ocr_texts)!=0:
+            verbalization_ocr = 'The image includes text descriptions: '
+            for i, txt in enumerate(ocr_texts):
+                verbalization_ocr += txt
+                if i!=len(ocr_texts)-1:
+                    verbalization_ocr += ', and '
+            verbalization_ocr += '.'
+        else:
+            verbalization_ocr = ''
+        return verbalization_ocr

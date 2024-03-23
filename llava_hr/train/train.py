@@ -21,7 +21,7 @@ import json
 import logging
 import pathlib
 from typing import Dict, Optional, Sequence, List
-
+import json
 import torch
 
 import transformers
@@ -63,7 +63,7 @@ class ModelArguments:
     mm_vision_select_feature: Optional[str] = field(default="patch")
     is_multipath_encoder: bool = field(default=False)
     vision_tower_slow: Optional[str] = field(default='convnext_large_mlp.clip_laion2b_ft_320')
-
+    scale_up_train_llm : bool = field(default=False) # if scale up llm 
 
 @dataclass
 class DataArguments:
@@ -119,6 +119,7 @@ class TrainingArguments(transformers.TrainingArguments):
     lavin_scale: float = 1.
     lavin_t: float = 10.
     pretrain_lavin_adapter: str=None
+    max_steps: int = 2
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -197,11 +198,56 @@ def find_all_linear_names(model):
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
 
-
+def save_model_in_parts(state_dict, output_dir, num_parts=5):
+    # Split state_dict into num_parts
+    keys = list(state_dict.keys())
+    parts = {i: {} for i in range(1,num_parts+1 )}
+    weight_map = {}
+    total_size = 0
+    
+    for i, key in enumerate(keys):
+        part = (i % num_parts)+1
+        parts[part][key] = state_dict[key]
+        weight_map[key] = f'pytorch_model-{part:04d}-of-{num_parts:05d}.bin'
+        total_size += torch.prod(torch.tensor(state_dict[key].size())).item() * state_dict[key].element_size()
+    
+    # Save each part
+    for i in range(1, num_parts+1):
+        part_file = os.path.join(output_dir, f'pytorch_model-{i:04d}-of-{num_parts:05d}.bin')
+        torch.save(parts[i], part_file)
+    
+    # Save the index file
+    index = {
+        "metadata": {"total_size": total_size},
+        "weight_map": weight_map
+    }
+    with open(os.path.join(output_dir, "pytorch_model.bin.index.json"), "w") as index_file:
+        json.dump(index, index_file, indent=2)
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                                    output_dir: str):
     """Collects the state dict and dump to disk."""
+    if getattr(trainer.args, "freeze_mm_mlp_adapter", False):
+        # for key in trainer.model.state_dict().keys():
+        #     print(key)
+        # exit()
+        # for name, param in trainer.model.named_parameters():
+        #     print(f"{name}: {param.dtype}")
+        # exit()
+        trainer.model.to(dtype=torch.float32)
+        included_keys = ['model.layers', 'lm_head', 'model.embed_tokens',"model.norm"]
+        llama_state_dict = {
+            k: v.cpu().detach() 
+            for k, v in trainer.model.state_dict().items() 
+            if any(k.startswith(key) for key in included_keys)
+        }
 
+        # print("Parameters to be saved:")
+        # for k in llama_state_dict.keys():
+        #     print(k)
+        # trainer.model.config.save_pretrained(output_dir)
+        save_model_in_parts(llama_state_dict, output_dir)
+        print(f"LlavaLlamaModel checkpoint saved ")
+        return
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
         keys_to_match = ['mm_projector','align_stages']
@@ -894,6 +940,7 @@ class LazySupervisedDataset(Dataset):
             sources = copy.deepcopy([e["conversations"] for e in sources])
         # for debug
         # print(sources)
+        # exit()
         data_dict = preprocess(
             sources,
             self.tokenizer,
@@ -971,7 +1018,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
 
 def train():
     global local_rank
-
+    
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
@@ -995,7 +1042,6 @@ def train():
                 bnb_4bit_quant_type=training_args.quant_type  # {'fp4', 'nf4'}
             )
         ))
-
     if model_args.vision_tower is not None:
         if 'mpt' in model_args.model_name_or_path:
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
@@ -1006,7 +1052,7 @@ def train():
                 cache_dir=training_args.cache_dir,
                 **bnb_model_from_pretrained_args
             )
-        else:
+        else: # pretrain in here
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
@@ -1035,9 +1081,7 @@ def train():
         else:
             def make_inputs_require_grad(module, input, output):
                 output.requires_grad_(True)
-
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
         lora_config = LoraConfig(
@@ -1106,8 +1150,8 @@ def train():
         model.config.vision_tower_slow=model_args.vision_tower_slow
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
         model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
-
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+
         if model_args.tune_mm_mlp_adapter:
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
@@ -1117,7 +1161,6 @@ def train():
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
-
         if model_args.is_multipath_encoder:
             total = 0
             trainable_params = []
@@ -1130,7 +1173,7 @@ def train():
             rank0_print(trainable_params)
             rank0_print('Enable MultiPath Encoder')
             rank0_print('  + Number of trainable params: %.2fM' % (total / 1e6))
-
+            
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
@@ -1138,7 +1181,15 @@ def train():
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
-
+    ############ if scale up llm ############
+    if model_args.scale_up_train_llm:
+        total = 0
+        for layer in model.model.layers[:24]:
+            for param in layer.parameters():
+                param.requires_grad = False
+                total += param.nelement()
+        rank0_print('Enable Scale_up Pre-train LLM')
+        rank0_print('  + Number of trainable params: %.2fM' % (total / 1e6))
     # set lavin
     # data_args.lavin_enable=training_args.lavin_enable
     setattr(data_args,'lavin_enable',training_args.lavin_enable)
@@ -1178,7 +1229,12 @@ def train():
                 trainable_params.append(name)
         # rank0_print('   trainable params: ',trainable_params)
         rank0_print('  + Number of trainable params: %.2fM' % (total / 1e6))
-
+    #### check trainable layers ########
+    # print("Checking which parts of the model are trainable:")
+    # for name, param in model.named_parameters():
+    #     print(f"{name} is {'trainable' if param.requires_grad else 'frozen'}")
+    # exit()
+    ####################################
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
         for name, module in model.named_modules():
@@ -1204,7 +1260,7 @@ def train():
     else:
         trainer.train()
     trainer.save_state()
-
+    # model.model.layers.save_pretrained('/data/luogen_code/LLaVA-HR-OCR/checkpoints/scale_up_llm_10b')
     model.config.use_cache = True
 
     if training_args.lora_enable:
